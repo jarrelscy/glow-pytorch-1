@@ -279,7 +279,6 @@ class Block(nn.Module):
         for flow in self.flows:
             out, det = flow(out)
             logdet = logdet + det
-
         if self.split:
             out, z_new = out.chunk(2, 1)
             mean, log_sd = self.prior(out).chunk(2, 1)
@@ -291,13 +290,12 @@ class Block(nn.Module):
             mean, log_sd = self.prior(zero).chunk(2, 1)
             log_p = gaussian_log_p(out, mean, log_sd)
             log_p = log_p.view(b_size, -1).sum(1)
-            z_new = out
-
-        return out, logdet, log_p
+            z_new = out            
+        eps = (z_new - mean) / torch.exp(log_sd)
+        return out, logdet, log_p, eps
 
     def reverse(self, output, eps=None):
         input = output
-
         if self.split:
             mean, log_sd = self.prior(input).chunk(2, 1)
             z = gaussian_sample(eps, mean, log_sd)
@@ -309,7 +307,7 @@ class Block(nn.Module):
             mean, log_sd = self.prior(zero).chunk(2, 1)
             z = gaussian_sample(eps, mean, log_sd)
             input = z
-
+        
         for flow in self.flows[::-1]:
             input = flow.reverse(input)
 
@@ -341,20 +339,35 @@ class Glow(nn.Module):
         out = input
 
         for block in self.blocks:
-            out, det, log_p = block(out)
+            
+            out, det, log_p, _ = block(out)
             logdet = logdet + det
 
             if log_p is not None:
                 log_p_sum = log_p_sum + log_p
 
         return log_p_sum, logdet
+    def encode(self, input):
+        out = input
+        rets = []
+        for block in self.blocks:            
+            out, _,_,ret = block(out)
+            rets.append(ret)            
+        return rets
+    def initialize(self):
+        '''
+        initializes actnorm - else when you load this from a checkpoint it will reinitialize loc and scale parameters
+        '''
+        for block in self.blocks:
+            for flow in block.flows:
+                flow.actnorm.initialized=True
 
     def reverse(self, z_list):
         for i, block in enumerate(self.blocks[::-1]):
-            if i == 0:
+            if i == 0:                
                 input = block.reverse(z_list[-1], z_list[-1])
-
             else:
                 input = block.reverse(input, z_list[-(i + 1)])
+            
 
         return input
