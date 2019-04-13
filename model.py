@@ -4,14 +4,17 @@ from torch.nn import functional as F
 from math import log, pi, exp
 import numpy as np
 from scipy import linalg as la
-
+from functools import partial
+import torch.utils.checkpoint
+torch.utils.checkpoint.preserve_rng_state=False
+from torch.utils.checkpoint import checkpoint
 logabs = lambda x: torch.log(torch.abs(x))
 
 
 class ActNorm(nn.Module):
     def __init__(self, in_channel, logdet=True):
         super().__init__()
-
+    
         self.loc = nn.Parameter(torch.zeros(1, in_channel, 1, 1))
         self.scale = nn.Parameter(torch.ones(1, in_channel, 1, 1))
 
@@ -80,9 +83,10 @@ class InvConv2d(nn.Module):
         return out, logdet
 
     def reverse(self, output):
-        return F.conv2d(
-            output, self.weight.squeeze().inverse().unsqueeze(2).unsqueeze(3)
-        )
+        if weight.type() == 'torch.cuda.HalfTensor':
+            return F.conv2d(output, weight.squeeze().float().inverse().unsqueeze(2).unsqueeze(3).half())
+        else:
+            return F.conv2d(output, weight.squeeze().inverse().unsqueeze(2).unsqueeze(3))
 
 
 class InvConv2dLU(nn.Module):
@@ -132,8 +136,10 @@ class InvConv2dLU(nn.Module):
 
     def reverse(self, output):
         weight = self.calc_weight()
-
-        return F.conv2d(output, weight.squeeze().inverse().unsqueeze(2).unsqueeze(3))
+        if weight.type() == 'torch.cuda.HalfTensor':
+            return F.conv2d(output, weight.squeeze().float().inverse().unsqueeze(2).unsqueeze(3).half())
+        else:
+            return F.conv2d(output, weight.squeeze().inverse().unsqueeze(2).unsqueeze(3))
 
 
 class ZeroConv2d(nn.Module):
@@ -212,7 +218,6 @@ class AffineCoupling(nn.Module):
 class Flow(nn.Module):
     def __init__(self, in_channel, affine=True, conv_lu=True):
         super().__init__()
-
         self.actnorm = ActNorm(in_channel)
 
         if conv_lu:
@@ -253,13 +258,12 @@ def gaussian_sample(eps, mean, log_sd):
 class Block(nn.Module):
     def __init__(self, in_channel, n_flow, split=True, affine=True, conv_lu=True):
         super().__init__()
-
+        self.in_channel = in_channel
         squeeze_dim = in_channel * 4
-
+        
         self.flows = nn.ModuleList()
         for i in range(n_flow):
             self.flows.append(Flow(squeeze_dim, affine=affine, conv_lu=conv_lu))
-
         self.split = split
 
         if split:
@@ -267,18 +271,36 @@ class Block(nn.Module):
 
         else:
             self.prior = ZeroConv2d(in_channel * 4, in_channel * 8)
-
+    def make_f(self, flows):
+        def f(out, logdet):
+            for flow in flows:
+                out, det = flow(out)
+                logdet = logdet + det
+            return out, logdet                
+        return f
     def forward(self, input):
         b_size, n_channel, height, width = input.shape
         squeezed = input.view(b_size, n_channel, height // 2, 2, width // 2, 2)
         squeezed = squeezed.permute(0, 1, 3, 5, 2, 4)
         out = squeezed.contiguous().view(b_size, n_channel * 4, height // 2, width // 2)
-
-        logdet = 0
-
-        for flow in self.flows:
-            out, det = flow(out)
-            logdet = logdet + det
+        
+        execs = []
+        numflowpercheckpoint = len(self.flows)//4
+        for i in range(1,len(self.flows),numflowpercheckpoint):
+            execs.append(self.make_f(self.flows[i:i+numflowpercheckpoint]))
+        #    
+        #    
+        out, logdet = self.flows[0](out)
+        for f in execs:
+            #out, logdet =checkpoint( f, out, logdet)
+            out, logdet = f(out, logdet)
+        #logdet = 0
+        #for flow in self.flows:
+        #    out, det = flow(out)
+        #    logdet = logdet + det
+                
+        
+            
         if self.split:
             out, z_new = out.chunk(2, 1)
             mean, log_sd = self.prior(out).chunk(2, 1)
@@ -321,7 +343,6 @@ class Block(nn.Module):
 
         return unsqueezed
 
-
 class Glow(nn.Module):
     def __init__(self, in_channel, n_flow, n_block, affine=True, conv_lu=True):
         super().__init__()
@@ -346,7 +367,7 @@ class Glow(nn.Module):
             if log_p is not None:
                 log_p_sum = log_p_sum + log_p
 
-        return log_p_sum, logdet
+        return log_p_sum.unsqueeze(0), logdet.unsqueeze(0)
     def encode(self, input):
         out = input
         rets = []
